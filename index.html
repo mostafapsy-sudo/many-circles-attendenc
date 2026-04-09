@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Many Circles Nursery - إدارة الحضور</title>
+    <title>Many Circles Nursery - إدارة الحضور والغياب</title>
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.rtl.min.css">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css">
     <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
@@ -18,7 +18,6 @@
         .sync-note { font-size: .92rem; color: #6c757d; }
         @media print { .no-print { display: none; } .print-only { display: block; } }
         #addTeacherBtn, #summaryReportBtn, #detailedReportBtn, #editAttendanceBtn, #backupBtn, #restoreBtn, #changeAdminPassBtn { margin-bottom: 20px; }
-        #applyPoints { margin: 10px; }
     </style>
 </head>
 <body>
@@ -89,7 +88,7 @@
                 <button class="btn btn-lg btn-success mx-2" id="checkInBtn"><i class="fas fa-sign-in-alt"></i> تسجيل حضور</button>
                 <button class="btn btn-lg btn-danger mx-2" id="checkOutBtn"><i class="fas fa-sign-out-alt"></i> تسجيل انصراف</button>
             </div>
-            <div class="text-center sync-note mb-3">يتم الحفظ بشكل مستقل لكل معلمة لمنع التداخل أو ضياع التسجيلات.</div>
+            <div class="text-center sync-note mb-3">يتم الحفظ بشكل مستقل لكل معلمة.</div>
             <div id="saveSuccessMessage" class="alert alert-success text-center hidden" role="alert">تم الحفظ بنجاح</div>
             <div id="teacherMonthDisplay" class="table-responsive"></div>
         </div>
@@ -136,6 +135,18 @@
         let currentMonth = new Date().getMonth();
         let currentYear = new Date().getFullYear();
         let teachersUnsubscribe = null;
+        let officialHolidays = {};
+
+        // تحويل 24h إلى 12h بصيغة AM/PM
+        function formatTo12Hour(time24) {
+            if (!time24) return '';
+            let [hours, minutes] = time24.split(':');
+            let h = parseInt(hours);
+            let ampm = h >= 12 ? 'م' : 'ص';
+            let h12 = h % 12;
+            if (h12 === 0) h12 = 12;
+            return `${h12.toString().padStart(2,'0')}:${minutes} ${ampm}`;
+        }
 
         function formatDateLocal(date) {
             let year = date.getFullYear();
@@ -180,7 +191,8 @@
             return Object.keys(attendance).sort().map(date => ({
                 date,
                 checkIn: attendance[date]?.checkIn || null,
-                checkOut: attendance[date]?.checkOut || null
+                checkOut: attendance[date]?.checkOut || null,
+                absenceType: attendance[date]?.absenceType || null
             }));
         }
 
@@ -190,7 +202,8 @@
                 if (item && item.date) {
                     result[item.date] = {
                         checkIn: item.checkIn || null,
-                        checkOut: item.checkOut || null
+                        checkOut: item.checkOut || null,
+                        absenceType: item.absenceType || null
                     };
                 }
             });
@@ -220,12 +233,12 @@
                 if (!snapshot.exists()) {
                     teachers = [];
                     adminPassword = '1234';
+                    officialHolidays = {};
                     return;
                 }
-
                 const data = snapshot.val();
                 adminPassword = data.adminPassword || '1234';
-
+                officialHolidays = data.officialHolidays || {};
                 if (Array.isArray(data.teachers)) {
                     teachers = data.teachers.map(t => normalizeTeacher(t));
                     await migrateTeachersArrayToObject();
@@ -259,7 +272,6 @@
                 } else {
                     teachers = Object.values(value).map(t => normalizeTeacher(t));
                 }
-
                 if (!document.getElementById('adminPanel').classList.contains('hidden')) {
                     renderAdminContent('main');
                 }
@@ -269,6 +281,18 @@
                         document.getElementById('teacherNameDisplay').innerText = currentTeacher.name;
                         renderTeacherCalendar(currentTeacher);
                     }
+                }
+            });
+            const holidaysRef = ref(db, 'officialHolidays');
+            onValue(holidaysRef, (snapshot) => {
+                officialHolidays = snapshot.val() || {};
+                if (!document.getElementById('adminPanel').classList.contains('hidden')) {
+                    const editBtn = document.getElementById('editAttendanceBtn');
+                    if (editBtn) editBtn.click();
+                }
+                if (currentTeacherId && !document.getElementById('teacherPanel').classList.contains('hidden')) {
+                    const currentTeacher = teachers.find(t => t.id == currentTeacherId);
+                    if (currentTeacher) renderTeacherCalendar(currentTeacher);
                 }
             });
         }
@@ -303,7 +327,7 @@
                 const normalized = normalizeTeacher(t);
                 mapped[normalized.id] = { ...normalized, attendance: attendanceArrayToObject(normalized.attendance) };
             });
-            await set(ref(db, '/'), { teachers: mapped, adminPassword: newAdminPassword || '1234' });
+            await set(ref(db, '/'), { teachers: mapped, adminPassword: newAdminPassword || '1234', officialHolidays });
         }
 
         async function autoLoginTeacher() {
@@ -423,7 +447,6 @@
                 attendance: oldTeacher?.attendance || [],
                 monthlyPoints: oldTeacher?.monthlyPoints || {}
             };
-
             try {
                 await saveTeacherRecord(teacher);
                 bootstrap.Modal.getInstance(document.getElementById('teacherModal')).hide();
@@ -435,25 +458,46 @@
 
         function renderTeacherCalendar(teacher) {
             let days = getWorkingDaysInMonth(currentYear, currentMonth);
-            let html = '<h5>أيام العمل لهذا الشهر</h5><table class="table table-sm table-bordered"><thead><tr><th>التاريخ</th><th>الحضور</th><th>الانصراف</th><th>تأخير</th><th>مبكر</th><th>إضافي</th></tr></thead><tbody>';
+            let html = '<h5>أيام العمل لهذا الشهر</h5><table class="table table-sm table-bordered"><thead><tr><th>التاريخ</th><th>نوع اليوم</th><th>الحضور</th><th>الانصراف</th><th>تأخير (د)</th><th>مبكر (د)</th><th>إضافي (د)</th></tr></thead><tbody>';
             days.forEach(day => {
                 let dateStr = formatDateLocal(day);
+                let isHoliday = officialHolidays[dateStr] === true;
                 let att = teacher.attendance ? teacher.attendance.find(a => a.date === dateStr) : null;
-                let checkIn = att ? att.checkIn : '';
-                let checkOut = att ? att.checkOut : '';
+                let absenceType = att ? att.absenceType : null;
+                let checkIn24 = att ? att.checkIn : '';
+                let checkOut24 = att ? att.checkOut : '';
+                let checkIn = formatTo12Hour(checkIn24);
+                let checkOut = formatTo12Hour(checkOut24);
+                
+                let typeText = "حضور";
                 let delay = 0, early = 0, extra = 0;
-                if (checkIn && teacher.workStartTime) {
-                    let inMin = timeToMinutes(checkIn);
-                    let startMin = timeToMinutes(teacher.workStartTime);
-                    if (inMin > startMin + 5) delay = inMin - startMin;
+                
+                if (isHoliday) {
+                    typeText = "إجازة رسمية";
+                } else if (absenceType === 'double') {
+                    typeText = "غياب مضاعف الخصم";
+                } else if (absenceType === 'normal') {
+                    typeText = "غياب عادي الخصم";
+                } else if (absenceType === 'no_deduction') {
+                    typeText = "غياب بدون خصم";
+                } else if (checkIn24 && checkOut24) {
+                    typeText = "حضور";
+                    if (checkIn24 && teacher.workStartTime) {
+                        let inMin = timeToMinutes(checkIn24);
+                        let startMin = timeToMinutes(teacher.workStartTime);
+                        if (inMin > startMin + 5) delay = inMin - startMin;
+                    }
+                    if (checkOut24 && teacher.workEndTime) {
+                        let outMin = timeToMinutes(checkOut24);
+                        let endMin = timeToMinutes(teacher.workEndTime);
+                        if (outMin < endMin - 5) early = endMin - outMin;
+                        else if (outMin > endMin) extra = outMin - endMin;
+                    }
+                } else if (!checkIn24 && !checkOut24 && !absenceType) {
+                    typeText = "غياب (لم يسجل)";
                 }
-                if (checkOut && teacher.workEndTime) {
-                    let outMin = timeToMinutes(checkOut);
-                    let endMin = timeToMinutes(teacher.workEndTime);
-                    if (outMin < endMin - 5) early = endMin - outMin;
-                    else if (outMin > endMin) extra = outMin - endMin;
-                }
-                html += `<tr><td>${dateStr}</td><td>${checkIn || '—'}</td><td>${checkOut || '—'}</td><td>${delay} د</td><td>${early} د</td><td>${extra} د</td></tr>`;
+                
+                html += `<tr><td>${dateStr}</td><td>${typeText}</td><td>${checkIn || '—'}</td><td>${checkOut || '—'}</td><td>${delay}</td><td>${early}</td><td>${extra}</td></tr>`;
             });
             html += '</tbody></table>';
             document.getElementById('teacherMonthDisplay').innerHTML = html;
@@ -464,9 +508,10 @@
             let today = formatDateLocal(new Date());
             let dayOfWeek = new Date().getDay();
             if (dayOfWeek === 5 || dayOfWeek === 6) { alert('اليوم عطلة'); return; }
+            if (officialHolidays[today]) { alert('اليوم إجازة رسمية، لا يمكن تسجيل حضور أو انصراف'); return; }
 
             let now = new Date();
-            let timeStr = now.getHours().toString().padStart(2, '0') + ':' + now.getMinutes().toString().padStart(2, '0');
+            let time24 = now.getHours().toString().padStart(2,'0') + ':' + now.getMinutes().toString().padStart(2,'0');
             let teacherRef = ref(db, 'teachers/' + currentTeacherId);
 
             try {
@@ -479,13 +524,13 @@
 
                     if (type === 'checkIn') {
                         if (dayEntry.checkIn) return;
-                        dayEntry.checkIn = timeStr;
+                        dayEntry.checkIn = time24;
+                        delete dayEntry.absenceType;
                     } else {
                         if (!dayEntry.checkIn) return;
                         if (dayEntry.checkOut) return;
-                        dayEntry.checkOut = timeStr;
+                        dayEntry.checkOut = time24;
                     }
-
                     teacher.attendance[today] = dayEntry;
                     return teacher;
                 });
@@ -501,43 +546,65 @@
             }
         }
 
-        document.getElementById('checkInBtn').addEventListener('click', () => markAttendance('checkIn'));
-        document.getElementById('checkOutBtn').addEventListener('click', () => markAttendance('checkOut'));
-
         function calculateTeacherSummary(teacher, month, year) {
             let days = getWorkingDaysInMonth(year, month);
             let dailyRate = getDailyRate(teacher, year, month);
             let minuteRate = getMinuteRate(teacher, year, month);
             let totalDays = 0, totalDelay = 0, totalEarly = 0, totalExtra = 0;
+            let deductionDays = 0;
             let monthKey = `${year}-${(month+1).toString().padStart(2,'0')}`;
             let totalPoints = (teacher.monthlyPoints && teacher.monthlyPoints[monthKey]) || 0;
 
             days.forEach(day => {
                 let dateStr = formatDateLocal(day);
+                let isHoliday = officialHolidays[dateStr] === true;
                 let att = teacher.attendance ? teacher.attendance.find(a => a.date === dateStr) : null;
-                if (att && att.checkIn && att.checkOut) {
+                let absenceType = att ? att.absenceType : null;
+                let checkIn = att ? att.checkIn : null;
+                let checkOut = att ? att.checkOut : null;
+
+                if (isHoliday || absenceType === 'no_deduction') {
                     totalDays++;
-                    let inMin = timeToMinutes(att.checkIn);
-                    let outMin = timeToMinutes(att.checkOut);
+                    return;
+                }
+                if (absenceType === 'normal') {
+                    deductionDays += 1;
+                    return;
+                }
+                if (absenceType === 'double') {
+                    deductionDays += 2;
+                    return;
+                }
+                if (checkIn && checkOut) {
+                    totalDays++;
+                    let inMin = timeToMinutes(checkIn);
+                    let outMin = timeToMinutes(checkOut);
                     let startMin = timeToMinutes(teacher.workStartTime);
                     let endMin = timeToMinutes(teacher.workEndTime);
                     if (inMin > startMin + 5) totalDelay += inMin - startMin;
                     if (outMin < endMin - 5) totalEarly += endMin - outMin;
                     if (outMin > endMin) totalExtra += outMin - endMin;
+                } else if (!absenceType && !isHoliday) {
+                    deductionDays += 1;
                 }
             });
+
             let basePay = totalDays * dailyRate;
+            let deductionAmount = deductionDays * dailyRate;
             let adjustments = (totalExtra - totalDelay - totalEarly) * minuteRate;
             let pointsValue = totalPoints * (dailyRate / 20);
-            let finalSalary = basePay + adjustments + pointsValue;
-            return { totalDays, totalDelay, totalEarly, totalExtra, totalPoints, basePay, adjustments, pointsValue, finalSalary };
+            let finalSalary = basePay - deductionAmount + adjustments + pointsValue;
+            return { totalDays, totalDelay, totalEarly, totalExtra, totalPoints, basePay, adjustments, pointsValue, deductionDays, finalSalary };
         }
 
+        document.getElementById('checkInBtn').addEventListener('click', () => markAttendance('checkIn'));
+        document.getElementById('checkOutBtn').addEventListener('click', () => markAttendance('checkOut'));
+
         document.getElementById('summaryReportBtn').addEventListener('click', function() {
-            let html = '<h4>ملخص سجل الحضور والانصراف</h4><table class="table table-striped" id="summaryTable"><thead><tr><th>المعلمة</th><th>أيام العمل</th><th>تأخير (د)</th><th>مبكر (د)</th><th>إضافي (د)</th><th>النقاط</th><th>الراتب المستحق</th></tr></thead><tbody>';
+            let html = '<h4>ملخص سجل الحضور والانصراف</h4><table class="table table-striped" id="summaryTable"><thead><tr><th>المعلمة</th><th>أيام الحضور الفعلي</th><th>أيام الخصم</th><th>تأخير (د)</th><th>مبكر (د)</th><th>إضافي (د)</th><th>النقاط</th><th>الراتب المستحق</th></tr></thead><tbody>';
             teachers.forEach(t => {
                 let sum = calculateTeacherSummary(t, currentMonth, currentYear);
-                html += `<tr><td>${t.name}</td><td>${sum.totalDays}</td><td>${sum.totalDelay}</td><td>${sum.totalEarly}</td><td>${sum.totalExtra}</td><td>${sum.totalPoints}</td><td>${sum.finalSalary.toFixed(2)}</td></tr>`;
+                html += `<tr><td>${t.name}</td><td>${sum.totalDays}</td><td>${sum.deductionDays}</td><td>${sum.totalDelay}</td><td>${sum.totalEarly}</td><td>${sum.totalExtra}</td><td>${sum.totalPoints}</td><td>${sum.finalSalary.toFixed(2)}</td></tr>`;
             });
             html += '</tbody></table><button class="btn btn-primary" onclick="printPDF(\'summaryTable\')">طباعة PDF</button>';
             document.getElementById('adminContent').innerHTML = html;
@@ -547,28 +614,40 @@
             let html = '<h4>التقرير التفصيلي</h4>';
             teachers.forEach(t => {
                 let days = getWorkingDaysInMonth(currentYear, currentMonth);
-                html += `<h5>${t.name}</h5><table class="table table-sm table-bordered"><thead><tr><th>التاريخ</th><th>حضور</th><th>انصراف</th><th>تأخير</th><th>مبكر</th><th>إضافي</th></tr></thead><tbody>`;
+                html += `<h5>${t.name}</h5><table class="table table-sm table-bordered"><thead><tr><th>التاريخ</th><th>نوع اليوم</th><th>حضور</th><th>انصراف</th><th>تأخير</th><th>مبكر</th><th>إضافي</th></tr></thead><tbody>`;
                 days.forEach(day => {
                     let dateStr = formatDateLocal(day);
+                    let isHoliday = officialHolidays[dateStr] === true;
                     let att = t.attendance ? t.attendance.find(a => a.date === dateStr) : null;
-                    let checkIn = att ? att.checkIn : '';
-                    let checkOut = att ? att.checkOut : '';
+                    let absenceType = att ? att.absenceType : null;
+                    let checkIn24 = att ? att.checkIn : '';
+                    let checkOut24 = att ? att.checkOut : '';
+                    let checkIn = formatTo12Hour(checkIn24);
+                    let checkOut = formatTo12Hour(checkOut24);
+                    let typeText = "حضور";
                     let delay = 0, early = 0, extra = 0;
-                    if (checkIn && t.workStartTime) {
-                        let inMin = timeToMinutes(checkIn);
-                        let startMin = timeToMinutes(t.workStartTime);
-                        if (inMin > startMin + 5) delay = inMin - startMin;
-                    }
-                    if (checkOut && t.workEndTime) {
-                        let outMin = timeToMinutes(checkOut);
-                        let endMin = timeToMinutes(t.workEndTime);
-                        if (outMin < endMin - 5) early = endMin - outMin;
-                        else if (outMin > endMin) extra = outMin - endMin;
-                    }
-                    html += `<tr><td>${dateStr}</td><td>${checkIn || '—'}</td><td>${checkOut || '—'}</td><td>${delay}</td><td>${early}</td><td>${extra}</td></tr>`;
+                    if (isHoliday) typeText = "إجازة رسمية";
+                    else if (absenceType === 'double') typeText = "غياب مضاعف";
+                    else if (absenceType === 'normal') typeText = "غياب عادي";
+                    else if (absenceType === 'no_deduction') typeText = "غياب بدون خصم";
+                    else if (checkIn24 && checkOut24) {
+                        if (checkIn24 && t.workStartTime) {
+                            let inMin = timeToMinutes(checkIn24);
+                            let startMin = timeToMinutes(t.workStartTime);
+                            if (inMin > startMin + 5) delay = inMin - startMin;
+                        }
+                        if (checkOut24 && t.workEndTime) {
+                            let outMin = timeToMinutes(checkOut24);
+                            let endMin = timeToMinutes(t.workEndTime);
+                            if (outMin < endMin - 5) early = endMin - outMin;
+                            else if (outMin > endMin) extra = outMin - endMin;
+                        }
+                    } else if (!checkIn24 && !checkOut24 && !absenceType) typeText = "غياب";
+                    
+                    html += `<tr><td>${dateStr}</td><td>${typeText}</td><td>${checkIn || '—'}</td><td>${checkOut || '—'}</td><td>${delay}</td><td>${early}</td><td>${extra}</td></tr>`;
                 });
                 let sum = calculateTeacherSummary(t, currentMonth, currentYear);
-                html += `<tr><td colspan="6"><strong>الإجمالي: أيام ${sum.totalDays}, النقاط: ${sum.totalPoints}, الراتب المستحق: ${sum.finalSalary.toFixed(2)}</strong></td></tr>`;
+                html += `<tr><td colspan="7"><strong>الإجمالي: أيام حضور ${sum.totalDays} - أيام خصم ${sum.deductionDays} - النقاط ${sum.totalPoints} - الراتب المستحق ${sum.finalSalary.toFixed(2)}</strong></td></tr>`;
                 html += '</tbody></table>';
             });
             html += '<button class="btn btn-primary" onclick="window.print()">طباعة PDF</button>';
@@ -581,11 +660,32 @@
         };
 
         document.getElementById('editAttendanceBtn').addEventListener('click', function() {
-            let html = '<h4>تعديل تسجيلات الحضور</h4><div class="row"><div class="col-4">اختر المعلمة: <select id="editTeacherSelect" class="form-select">';
+            let html = '<h4>تعديل تسجيلات الحضور والغياب</h4>';
+            html += '<div class="row mb-3"><div class="col-4"><label>اختر المعلمة</label><select id="editTeacherSelect" class="form-select">';
             teachers.forEach(t => html += `<option value="${t.id}">${t.name}</option>`);
-            html += '</select></div><div class="col-4">اختر اليوم: <input type="date" id="editDate" class="form-control"></div><div class="col-4"><button class="btn btn-primary mt-4" id="loadEdit">عرض</button></div></div>';
+            html += '</select></div><div class="col-4"><label>اختر اليوم</label><input type="date" id="editDate" class="form-control"></div>';
+            html += '<div class="col-4"><button class="btn btn-primary mt-4" id="loadEdit">عرض / تعديل</button></div></div>';
+            html += '<div class="row mb-3"><div class="col-12"><button class="btn btn-danger" id="setOfficialHolidayBtn"><i class="fas fa-calendar-alt"></i> تعيين اليوم كإجازة رسمية لجميع المعلمات</button> <button class="btn btn-warning" id="removeOfficialHolidayBtn"><i class="fas fa-trash-alt"></i> إلغاء الإجازة الرسمية لهذا اليوم</button></div></div>';
             html += '<div id="editArea"></div>';
             document.getElementById('adminContent').innerHTML = html;
+
+            document.getElementById('setOfficialHolidayBtn').addEventListener('click', async function() {
+                let date = document.getElementById('editDate').value;
+                if (!date) { alert('اختر التاريخ أولاً'); return; }
+                if (confirm(`هل تريد تعيين يوم ${date} كإجازة رسمية لجميع المعلمات؟`)) {
+                    await set(ref(db, 'officialHolidays/' + date), true);
+                    alert('تم تعيين الإجازة الرسمية');
+                }
+            });
+
+            document.getElementById('removeOfficialHolidayBtn').addEventListener('click', async function() {
+                let date = document.getElementById('editDate').value;
+                if (!date) { alert('اختر التاريخ أولاً'); return; }
+                if (confirm(`هل تريد إلغاء الإجازة الرسمية ليوم ${date}؟`)) {
+                    await remove(ref(db, 'officialHolidays/' + date));
+                    alert('تم الإلغاء');
+                }
+            });
 
             document.getElementById('loadEdit').addEventListener('click', function() {
                 let teacherId = document.getElementById('editTeacherSelect').value;
@@ -598,39 +698,60 @@
                 let [year, month] = date.split('-');
                 let monthKey = `${year}-${month}`;
                 let currentPoints = (teacher.monthlyPoints && teacher.monthlyPoints[monthKey]) || 0;
+                let isOfficialHoliday = officialHolidays[date] === true;
+                let absenceType = att ? att.absenceType : '';
+                let checkIn = att ? att.checkIn : '';
+                let checkOut = att ? att.checkOut : '';
 
                 area.innerHTML = `
-                    <hr><h6>تعديل يوم ${date}</h6>
-                    <div class="row">
-                        <div class="col-3">حضور: <input type="time" id="editIn" value="${att?.checkIn || ''}"></div>
-                        <div class="col-3">انصراف: <input type="time" id="editOut" value="${att?.checkOut || ''}"></div>
-                        <div class="col-3"><button class="btn btn-success" id="saveEditDay">حفظ</button></div>
+                    <hr><h6>تعديل يوم ${date} للمعلمة ${teacher.name}</h6>
+                    <div class="alert alert-info">إذا كان اليوم محدداً كإجازة رسمية، سيتم التعامل معه كحضور كامل لجميع المعلمات تلقائياً.</div>
+                    <div class="row mb-2">
+                        <div class="col-3"><label>نوع اليوم:</label>
+                            <select id="absenceTypeSelect" class="form-select">
+                                <option value="">حضور (تسجيل دخول/خروج)</option>
+                                <option value="normal" ${absenceType === 'normal' ? 'selected' : ''}>غياب عادي الخصم</option>
+                                <option value="double" ${absenceType === 'double' ? 'selected' : ''}>غياب مضاعف الخصم</option>
+                                <option value="no_deduction" ${absenceType === 'no_deduction' ? 'selected' : ''}>غياب بدون خصم</option>
+                            </select>
+                        </div>
+                        <div class="col-3"><label>وقت الحضور</label><input type="time" id="editIn" class="form-control" value="${checkIn}"></div>
+                        <div class="col-3"><label>وقت الانصراف</label><input type="time" id="editOut" class="form-control" value="${checkOut}"></div>
+                        <div class="col-3"><button class="btn btn-success mt-4" id="saveEditDay">حفظ التعديلات</button></div>
                     </div>
-                    <hr><h6>إضافة/خصم نقاط</h6>
+                    <hr><h6>إضافة/خصم نقاط شهرية</h6>
                     <div class="row">
-                        <div class="col-3"><input type="number" id="pointsInput" placeholder="نقاط (موجب/سالب)" value="0"></div>
+                        <div class="col-3"><input type="number" id="pointsInput" class="form-control" placeholder="نقاط (موجب/سالب)" value="0"></div>
                         <div class="col-3"><button class="btn btn-warning" id="applyPoints">تطبيق نقاط</button></div>
                     </div>
                     <div class="mt-2">النقاط الحالية لهذا الشهر: <strong>${currentPoints}</strong></div>
                 `;
 
                 document.getElementById('saveEditDay').addEventListener('click', async function() {
+                    let selectedType = document.getElementById('absenceTypeSelect').value;
+                    let newCheckIn = document.getElementById('editIn').value || null;
+                    let newCheckOut = document.getElementById('editOut').value || null;
                     try {
                         await runTransaction(ref(db, 'teachers/' + teacherId), (serverTeacher) => {
                             if (!serverTeacher) return serverTeacher;
                             if (!serverTeacher.attendance || Array.isArray(serverTeacher.attendance)) {
                                 serverTeacher.attendance = attendanceArrayToObject(attendanceObjectToArray(serverTeacher.attendance));
                             }
-                            serverTeacher.attendance[date] = {
-                                checkIn: document.getElementById('editIn').value || null,
-                                checkOut: document.getElementById('editOut').value || null
-                            };
+                            if (!selectedType && (!newCheckIn || !newCheckOut)) {
+                                alert('لحفظ اليوم كحضور يجب إدخال وقت الحضور والانصراف');
+                                return null;
+                            }
+                            let dayData = { checkIn: newCheckIn, checkOut: newCheckOut };
+                            if (selectedType) dayData.absenceType = selectedType;
+                            else delete dayData.absenceType;
+                            serverTeacher.attendance[date] = dayData;
                             return serverTeacher;
                         });
-                        alert('تم الحفظ');
+                        alert('تم حفظ البيانات');
+                        document.getElementById('loadEdit').click();
                     } catch (error) {
                         console.error(error);
-                        alert('تعذر حفظ التعديل');
+                        alert('تعذر الحفظ');
                     }
                 });
 
@@ -651,7 +772,7 @@
         });
 
         document.getElementById('backupBtn').addEventListener('click', function() {
-            let data = { teachers, adminPassword };
+            let data = { teachers, adminPassword, officialHolidays };
             let blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
             let url = URL.createObjectURL(blob);
             let a = document.createElement('a');
@@ -672,6 +793,7 @@
                     try {
                         let data = JSON.parse(ev.target.result);
                         const restoredTeachers = Array.isArray(data.teachers) ? data.teachers : Object.values(data.teachers || {});
+                        officialHolidays = data.officialHolidays || {};
                         await replaceAllData(restoredTeachers, data.adminPassword || '1234');
                         alert('تمت الاستعادة');
                     } catch (error) {
